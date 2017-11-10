@@ -5,6 +5,9 @@
 #include <unistd.h>
 
 #include <thread>
+#include <chrono>
+#include <list>
+
 #include <sys/mman.h>
 #include <poll.h>
 #include <arpa/inet.h>
@@ -14,12 +17,13 @@
 #include <linux/if_packet.h>
 #include <net/ethernet.h> /* the L2 protocols */
 
-/*
-Parser files:
-https://raw.githubusercontent.com/pavel-odintsov/fastnetmon/master/src/fastnetmon_packet_parser.c
-https://raw.githubusercontent.com/pavel-odintsov/fastnetmon/master/src/fastnetmon_packet_parser.h
-*/
 #include "fastnetmon_packet_parser.h"
+
+// Number of worker threads
+unsigned int threads_number = 8;
+
+// Number of cpus to bind
+unsigned int num_cpus = 8;
 
 // 4194304 bytes
 unsigned int blocksiz = 1 << 22; 
@@ -27,17 +31,13 @@ unsigned int blocksiz = 1 << 22;
 unsigned int framesiz = 1 << 11; 
 unsigned int blocknum = 64; 
 
+std::string interface = "enp130s0f0";
+
 struct block_desc {
     uint32_t version;
     uint32_t offset_to_priv;
     struct tpacket_hdr_v1 h1;
 };
-
-/*
-Build it:
-g++ fastnetmon_packet_parser.c -ofastnetmon_packet_parser.o -c -std=c++11
-g++ af_packet.cpp fastnetmon_packet_parser.o -lboost_thread -lboost_system -lpthread -std=c++11 
-*/
 
 // Get interface number by name
 int get_interface_number_by_device_name(int socket_fd, std::string interface_name) {
@@ -66,8 +66,8 @@ void speed_printer() {
     while (true) {
         uint64_t packets_before = received_packets;
         
-        boost::this_thread::sleep(boost::posix_time::seconds(1));       
-        
+        std::this_thread::sleep_for(std::chrono::seconds(1));
+ 
         uint64_t packets_after = received_packets;
         uint64_t pps = packets_after - packets_before;
 
@@ -128,7 +128,7 @@ int setup_socket(std::string interface_name, int fanout_group_id) {
     int packet_socket = socket(AF_PACKET, SOCK_RAW, htons(ETH_P_ALL));
    
     if (packet_socket == -1) {
-        printf("Can't create AF_PACKET socket\n");
+        std::cerr << "Can't create AF_PACKET socket: " << strerror(errno) << std::endl;
         return -1;
     }
 
@@ -270,40 +270,45 @@ bool execute_strict_cpu_affinity = false;
 
 bool use_multiple_fanout_processes = true;
 
+using namespace std;
+
 int main() {
     int fanout_group_id = getpid() & 0xffff;
 
-    boost::thread speed_printer_thread( speed_printer );
+    std::thread speed_printer_thread( speed_printer );
 
     if (use_multiple_fanout_processes) {
-        boost::thread_group packet_receiver_thread_group;
+        list<thread*> packet_receiver_thread_group;
 
-        unsigned int num_cpus = 8;
-        for (int cpu = 0; cpu < num_cpus; cpu++) {
-            boost::thread::attributes thread_attrs;
+        for (int i = 0; i < threads_number; i++) {
+            auto current_thread = new thread(start_af_packet_capture, interface, fanout_group_id);
+            packet_receiver_thread_group.push_back(current_thread);
+        }
 
-            if (execute_strict_cpu_affinity) {
+        int current_cpu = 0;
+        for (auto& thread : packet_receiver_thread_group) {
+ 	    if (execute_strict_cpu_affinity) {
                 cpu_set_t current_cpu_set;
 
-                int cpu_to_bind = cpu % num_cpus;
+                int cpu_to_bind = current_cpu % num_cpus;
+                std::cout << "Bind to CPU: " << cpu_to_bind << std::endl;
                 CPU_ZERO(&current_cpu_set);
                 // We count cpus from zero
                 CPU_SET(cpu_to_bind, &current_cpu_set);
 
-                int set_affinity_result = pthread_attr_setaffinity_np(thread_attrs.native_handle(), sizeof(cpu_set_t), &current_cpu_set);
-    
+                int set_affinity_result = pthread_attr_setaffinity_np((pthread_attr_t*)thread->native_handle(), sizeof(cpu_set_t), &current_cpu_set);
+
                 if (set_affinity_result != 0) {
                     printf("Can't set CPU affinity for thread\n");
-                } 
+                }
             }
 
-            packet_receiver_thread_group.add_thread(
-                new boost::thread(thread_attrs, boost::bind(start_af_packet_capture, "eth6", fanout_group_id))
-            );
         }
 
         // Wait all processes for finish
-        packet_receiver_thread_group.join_all();
+	for (auto& thread : packet_receiver_thread_group) {
+	    thread->join();
+	}
     } else {    
         start_af_packet_capture("eth6", 0);
     }
